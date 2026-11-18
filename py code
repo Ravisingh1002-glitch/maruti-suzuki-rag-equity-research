@@ -1,0 +1,231 @@
+%pip install -q --upgrade google-genai langchain langchain-core langchain-community langchain-huggingface langchain-text-splitters chromadb pypdf sentence-transformers reportlab
+
+import os, re, time, random, html, warnings
+warnings.filterwarnings("ignore")
+
+from google import genai
+from google.genai import errors, types
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+
+# ---------- 1. AUTH (Direct Non-Blocking Assignment) ----------
+print("[Step 1/7] Authenticating with Google AI Studio...")
+# Paste your active Google AI Studio API key below (No getpass() hang!)
+os.environ["GOOGLE_API_KEY"] = "your api key here".strip()
+
+client = genai.Client()
+available = [m.name.replace("models/", "") for m in client.models.list()
+             if "generateContent" in (m.supported_actions or [])]
+print("           Available flash models:", [m for m in available if "flash" in m])
+
+# ---------- 2. INGESTION & VECTOR DB ----------
+print("[Step 2/7] Loading PDF and building Chroma vector database...")
+document = PyPDFLoader("q2_fy27.pdf").load()
+chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(document)
+embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+vector_db = Chroma.from_documents(documents=chunks, embedding=embeddings)
+print(f"           Vector DB built from {len(chunks)} chunks.")
+
+# ---------- 3. MULTI-QUERY RETRIEVAL & DEDUPLICATION ----------
+print("[Step 3/7] Retrieving and deduplicating transcript chunks...")
+queries = [
+    "margin compression gross margin EBITDA raw material costs",
+    "commodity inflation steel aluminium precious metals",
+    "commodity settlement lag 3 month 1 month change",
+    "price increase decision wait commodity stabilise",
+    "capacity expansion Kharkhoda Hansalpur line",
+    "Q2 sales volume domestic exports order backlog",
+]
+seen, retrieved = set(), []
+for q in queries:
+    for d in vector_db.similarity_search(q, k=5):
+        if d.page_content not in seen:
+            seen.add(d.page_content)
+            retrieved.append(d)
+context_text = "\n\n---\n\n".join(d.page_content for d in retrieved)
+
+for d in retrieved:
+    if "lag" in d.page_content.lower():
+        print("\n[SETTLEMENT LAG PASSAGE - verify wording & timing]\n", d.page_content, "\n")
+        break
+
+# ---------- 4. INPUTS (Math & Buy-Side Valuation Bridge Done in Python) ----------
+print("[Step 4/7] Preparing DCF scenario inputs and buy-side valuation bridge...")
+cmp_price = 12854
+bear_target = 9500
+cogs_assumption = "82.5%"
+downside_pct = (bear_target / cmp_price - 1) * 100
+as_of = "17 November 2026"
+
+# Explicit Q2 FY27 headline figures & DCF sensitivity anchors
+q2_revenue_cr = "53,340"
+q2_pat_cr = "2,415"
+q2_pat_yoy = "-26.9%"
+q2_ebitda_margin = "9.4%"
+bear_terminal_ebitda = "6.9%"
+bear_fcf_cut = "~22%"
+bear_implied_pe = "~19x"
+
+inputs_text = (
+    f"CMP INR {cmp_price:,} as of {as_of}; Bear Case Target INR {bear_target:,}; "
+    f"Bear COGS {cogs_assumption}; implied downside {downside_pct:.1f}%; "
+    f"Q2 Revenue INR {q2_revenue_cr} crore (+26.0% YoY); Q2 PAT INR {q2_pat_cr} crore ({q2_pat_yoy} YoY); "
+    f"EBITDA margin {q2_ebitda_margin}; Bear terminal EBITDA {bear_terminal_ebitda}; "
+    f"FCF reduction {bear_fcf_cut}; implied P/E {bear_implied_pe}; 250 bps"
+)
+
+prompt = f"""
+You are an institutional equity research analyst writing a concise 2-page earnings-call note on Maruti Suzuki (Q2 FY27).
+
+STRICT RULES:
+1. Company facts and figures come ONLY from the transcript context and the pre-computed inputs below. Add no outside figures.
+2. Do NOT assign a rating. Do NOT invent a base or bull case or any other target price.
+3. Any statement not directly supported by the transcript or the inputs MUST start with "Analyst inference:".
+4. Do not describe the size of the margin impact using vague adjectives unless supported by the transcript or inputs.
+5. If the transcript does not state timing, use "recently" rather than guessing.
+6. Use the pre-computed numbers exactly as given. Do not recalculate.
+7. Start directly with the first section heading. No title block.
+8. Do NOT output any Markdown tables (never use | pipe characters), because the summary valuation table is already rendered at the top of the PDF report.
+
+ANALYST BEAR-CASE & Q2 FY27 P&L INPUTS (a scenario, not a base-case target):
+- Current market price: INR {cmp_price:,} as of {as_of}
+- Bear Case Target Price: INR {bear_target:,} (Implied downside: {downside_pct:.1f}%)
+- Bear Case COGS assumption: {cogs_assumption} of net revenues
+- Q2 FY27 Headline Divergence (Include in Section 1): Operating Revenue of INR {q2_revenue_cr} crore (+26.0% YoY) contrasted with Net Profit (PAT) of INR {q2_pat_cr} crore ({q2_pat_yoy} YoY) and Operating EBITDA Margin of {q2_ebitda_margin}.
+- Bear-Case DCF Valuation Bridge (Include in Section 4 as Analyst inference): Stressing COGS to {cogs_assumption} compresses terminal EBITDA margins by ~250 bps from {q2_ebitda_margin} toward {bear_terminal_ebitda}, cutting projected FY27E/FY28E Free Cash Flow by {bear_fcf_cut} and yielding the INR {bear_target:,} DCF target ({bear_implied_pe} bear-case forward EPS).
+
+Use these exact headers:
+# 1. Investment Thesis
+# 2. Margin Compression Risks
+# 3. Capacity & Sales Volume Updates
+# 4. Valuation & DCF Scenario Summary
+
+Context from transcript:
+{context_text}
+"""
+
+# ---------- 5. GENERATION WITH RETRY / FALLBACK ----------
+print("[Step 5/7] Generating Institutional Equity Research Note...")
+preferred = ["gemini-flash-lite-latest", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite",
+             "gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.8-flash"]
+model_fallbacks = [m for m in preferred if m in available] or \
+                  [m for m in available if "flash" in m][:3]
+print("           Will try:", model_fallbacks)
+
+RETRYABLE = {429, 500, 502, 503, 504}
+MAX_ATTEMPTS = 5
+cfg = types.GenerateContentConfig(temperature=0.2)
+response, used_model = None, None
+
+for model_name in model_fallbacks:
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"           Drafting with {model_name} (attempt {attempt}/{MAX_ATTEMPTS})...")
+            response = client.models.generate_content(model=model_name, contents=prompt, config=cfg)
+            if response.text:
+                used_model = model_name
+                break
+            response = None
+        except errors.APIError as e:
+            code = getattr(e, "code", None)
+            if code in RETRYABLE and attempt < MAX_ATTEMPTS:
+                wait = min(60, 5 * (2 ** (attempt - 1))) + random.uniform(0, 3)
+                print(f"           {model_name} returned {code}. Waiting {wait:.0f}s...")
+                time.sleep(wait)
+            else:
+                print(f"           {model_name} failed ({code}); switching to next model.")
+                break
+    if used_model:
+        break
+
+if not used_model:
+    raise SystemExit("All models unavailable. Wait a few minutes and re-run.")
+
+note = response.text
+print("=" * 80 + "\n" + note + "\n" + "=" * 80)
+
+# ---------- 6. FACT-CHECK ----------
+print("[Step 6/7] Running automated numerical audit...")
+source = context_text + " " + inputs_text
+nums = {n.rstrip(".,") for n in re.findall(r"\d[\d,\.]*", note)}
+suspect = sorted(n for n in nums if len(n) >= 3 and n not in source)
+print("           Numbers NOT found in transcript/inputs (verify manually):", suspect or "none")
+
+# ---------- 7. PDF REPORT (Fixed Pipe Table Filter & Footer Alignment) ----------
+print("[Step 7/7] Building formatted A4 PDF report...")
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+
+NAVY = colors.HexColor("#1F3A5F")
+ss = getSampleStyleSheet()
+title  = ParagraphStyle("t", parent=ss["Title"], fontSize=18, textColor=NAVY, alignment=0, spaceAfter=2)
+sub    = ParagraphStyle("s", parent=ss["Normal"], fontSize=9.5, textColor=colors.grey, spaceAfter=8)
+h      = ParagraphStyle("h", parent=ss["Heading2"], fontSize=12.5, textColor=NAVY, spaceBefore=10, spaceAfter=4)
+body   = ParagraphStyle("b", parent=ss["Normal"], fontSize=10, leading=14.5, spaceAfter=6)
+bullet = ParagraphStyle("bl", parent=body, leftIndent=16, bulletIndent=4, spaceAfter=3)
+
+def md_inline(t):
+    t = html.escape(t).replace("→", "to").replace("≈", "~")
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    t = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"<i>\1</i>", t)
+    return t
+
+def footer(canvas, doc):
+    canvas.saveState()
+    canvas.setFont("Helvetica", 7.5)
+    canvas.setFillColor(colors.grey)
+    # Clean left disclaimer & right page number with zero text overlap
+    canvas.drawString(2*cm, 1.2*cm, "Bear-case scenario analysis based on Q2 FY27 earnings disclosures. Not investment advice.")
+    canvas.drawRightString(A4[0] - 2*cm, 1.2*cm, f"Page {doc.page}")
+    canvas.restoreState()
+
+lines = note.splitlines()
+first = next((i for i, l in enumerate(lines) if l.strip().startswith("#")), 0)
+lines = lines[first:]
+
+story = [
+    Paragraph("Maruti Suzuki India Ltd (MSIL)", title),
+    Paragraph(f"Q2 FY27 Earnings Call Note | Bear Case Scenario | {as_of}", sub),
+    HRFlowable(width="100%", thickness=1.2, color=NAVY, spaceAfter=8),
+]
+
+data = [["Current Market Price", "Bear Case Target", "Implied Downside", "Bear COGS Assumption"],
+        [f"INR {cmp_price:,}", f"INR {bear_target:,}", f"{downside_pct:.1f}%", f"{cogs_assumption} of net revenues"]]
+tbl = Table(data, colWidths=[4.2*cm]*4)
+tbl.setStyle(TableStyle([
+    ("BACKGROUND", (0,0), (-1,0), NAVY), ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+    ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 8.5),
+    ("ALIGN", (0,0), (-1,-1), "CENTER"), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+    ("BACKGROUND", (0,1), (-1,1), colors.HexColor("#EEF2F7")),
+    ("FONTNAME", (0,1), (-1,1), "Helvetica-Bold"),
+    ("GRID", (0,0), (-1,-1), 0.4, colors.lightgrey),
+    ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+]))
+story += [tbl, Spacer(1, 8)]
+
+for line in lines:
+    s = line.strip()
+    # Automatically strips empty lines, horizontal dividers (---), and any raw Markdown pipe rows (|...|)
+    if not s or re.fullmatch(r"-{3,}", s) or s.startswith("|"):
+        continue
+    if s.startswith("#"):
+        story.append(Paragraph(md_inline(s.lstrip("#").strip()), h))
+    elif re.match(r"^[-*•]\s+", s):
+        story.append(Paragraph(md_inline(re.sub(r"^[-*•]\s+", "", s)), bullet, bulletText="•"))
+    else:
+        story.append(Paragraph(md_inline(s), body))
+
+pdf_name = "MSIL_Q2FY27_Research_Note_v2.pdf"
+SimpleDocTemplate(pdf_name, pagesize=A4, leftMargin=2*cm, rightMargin=2*cm,
+                  topMargin=1.8*cm, bottomMargin=2*cm,
+                  title="MSIL Q2 FY27 Earnings Call Note", author="Equity Research"
+                  ).build(story, onFirstPage=footer, onLaterPages=footer)
+print(f"Saved {pdf_name} (generated with {used_model})")
+
+from google.colab import files
+files.download(pdf_name)
